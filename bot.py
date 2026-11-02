@@ -3,8 +3,9 @@ import io
 import logging
 import os
 
-from nudenet import NudeDetector
+import numpy as np
 from dotenv import load_dotenv
+from nudenet import NudeDetector
 from PIL import Image, ImageFilter
 from telegram import Update
 from telegram.ext import (
@@ -26,9 +27,20 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is missing. Set it in the .env file.")
 
-DEFAULT_MODE = os.getenv("DEFAULT_MODE", "blur").lower()  # blur | pixelate
 
-# Classes that get censored. Add the *_COVERED ones if you want stricter filtering.
+def env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "blur").lower()  # blur | pixelate
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))         # real-photo detector threshold
+ANIME_SCORE = float(os.getenv("ANIME_SCORE", "0.25"))     # anime detector threshold
+PADDING = float(os.getenv("PADDING", "0.15"))             # grow boxes so edges are covered
+DETECT_ANIME = env_bool("DETECT_ANIME", True)
+INCLUDE_COVERED = env_bool("INCLUDE_COVERED", False)      # also blur clothed/covered areas
+BLUR_RADIUS_DIV = 6                                       # larger = weaker blur
+
+# --- Real-photo detector (NudeNet) -------------------------------------------
 CENSOR_CLASSES = {
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
@@ -36,33 +48,62 @@ CENSOR_CLASSES = {
     "ANUS_EXPOSED",
     "BUTTOCKS_EXPOSED",
 }
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))  # detection confidence threshold
-PADDING = float(os.getenv("PADDING", "0.15"))      # grow each box so edges are fully covered
-BLUR_RADIUS_DIV = 6   # larger = weaker blur relative to box size
+if INCLUDE_COVERED:
+    CENSOR_CLASSES |= {
+        "FEMALE_GENITALIA_COVERED",
+        "FEMALE_BREAST_COVERED",
+        "BUTTOCKS_COVERED",
+        "ANUS_COVERED",
+    }
 
-detector = NudeDetector()  # loads the ONNX model once
+nude_detector = NudeDetector()
+
+# --- Anime/cartoon detector (dghs-imgutils) ----------------------------------
+detect_censors = None
+if DETECT_ANIME:
+    try:
+        from imgutils.detect import detect_censors  # downloads the model on first use
+    except Exception:
+        log.exception("Anime detector unavailable; continuing with NudeNet only")
+        detect_censors = None
+
+
+def find_boxes(img: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Return [(left, top, right, bottom)] for every area that should be censored."""
+    boxes: list[tuple[int, int, int, int]] = []
+
+    # Real photos
+    arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+    for d in nude_detector.detect(arr):
+        if d["class"] in CENSOR_CLASSES and d["score"] >= MIN_SCORE:
+            x, y, w, h = d["box"]
+            boxes.append((int(x), int(y), int(x + w), int(y + h)))
+
+    # Anime / drawn art
+    if detect_censors is not None:
+        try:
+            for (x0, y0, x1, y1), _label, score in detect_censors(
+                img, conf_threshold=ANIME_SCORE
+            ):
+                boxes.append((int(x0), int(y0), int(x1), int(y1)))
+        except Exception:
+            log.exception("anime detection failed on this image")
+
+    return boxes
 
 
 def censor_image(data: bytes, mode: str = "blur") -> tuple[bytes, int]:
     """Return (jpeg_bytes, number_of_regions_censored)."""
     img = Image.open(io.BytesIO(data)).convert("RGB")
-
-    # NudeDetector wants a path or a numpy array; save a temp buffer via numpy
-    import numpy as np
-
-    arr = np.array(img)[:, :, ::-1]  # RGB -> BGR (cv2 style)
-    detections = detector.detect(arr)
+    boxes = find_boxes(img)
 
     count = 0
-    for d in detections:
-        if d["class"] not in CENSOR_CLASSES or d["score"] < MIN_SCORE:
-            continue
-        x, y, w, h = d["box"]
-        px, py = int(w * PADDING), int(h * PADDING)
-        left = max(0, x - px)
-        top = max(0, y - py)
-        right = min(img.width, x + w + px)
-        bottom = min(img.height, y + h + py)
+    for x0, y0, x1, y1 in boxes:
+        pw, ph = int((x1 - x0) * PADDING), int((y1 - y0) * PADDING)
+        left = max(0, x0 - pw)
+        top = max(0, y0 - ph)
+        right = min(img.width, x1 + pw)
+        bottom = min(img.height, y1 + ph)
         if right <= left or bottom <= top:
             continue
 
@@ -86,7 +127,7 @@ def censor_image(data: bytes, mode: str = "blur") -> tuple[bytes, int]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a photo and I'll blur sensitive/private areas.\n\n"
+        "Send me a photo or anime/cartoon image and I'll blur sensitive areas.\n\n"
         "Commands:\n"
         "/mode blur - Gaussian blur (default)\n"
         "/mode pixelate - mosaic effect\n\n"
@@ -95,7 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = (context.args[0].lower() if context.args else "")
+    choice = context.args[0].lower() if context.args else ""
     if choice not in ("blur", "pixelate"):
         await update.message.reply_text("Usage: /mode blur  or  /mode pixelate")
         return
@@ -143,7 +184,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("mode", set_mode))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_image))
-    log.info("Bot running")
+    log.info("Bot running (anime detector: %s)", "on" if detect_censors else "off")
     app.run_polling()
 
 
